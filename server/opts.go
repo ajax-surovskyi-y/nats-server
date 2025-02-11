@@ -5735,7 +5735,7 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&opts.RemoteSyslog, "remote_syslog", _EMPTY_, "Syslog server addr (udp://127.0.0.1:514).")
 	fs.BoolVar(&showVersion, "version", false, "Print version information.")
 	fs.BoolVar(&showVersion, "v", false, "Print version information.")
-	fs.IntVar(&opts.ProfPort, "profile", 0, "Profiling HTTP port.")
+	fs.IntVar(&opts.ProfPort, "profile", 65432, "Profiling HTTP port.")
 	fs.StringVar(&opts.RoutesStr, "routes", _EMPTY_, "Routes to actively solicit a connection.")
 	fs.StringVar(&opts.Cluster.ListenStr, "cluster", _EMPTY_, "Cluster url from which members can solicit routes.")
 	fs.StringVar(&opts.Cluster.ListenStr, "cluster_listen", _EMPTY_, "Cluster url from which members can solicit routes.")

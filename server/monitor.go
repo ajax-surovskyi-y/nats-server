@@ -3966,3 +3966,8 @@ func (s *Server) Raftz(opts *RaftzOptions) *RaftzStatus {
 
 	return &infos
 }
+
+func (s *Server) HandleGC(w http.ResponseWriter, r *http.Request) {
+	runtime.GC()
+	w.Write([]byte("GC triggered"))
+}
