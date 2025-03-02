@@ -16,7 +16,6 @@ package server
 import (
 	"archive/tar"
 	"bytes"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +32,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/s2"
+	"github.com/nats-io/nats-server/v2/server/gsl"
 	"github.com/nats-io/nuid"
 )
 
@@ -329,10 +329,10 @@ type stream struct {
 
 	// For processing consumers without main stream lock.
 	clsMu sync.RWMutex
-	cList []*consumer     // Consumer list.
-	sch   chan struct{}   // Channel to signal consumers.
-	sigq  *ipQueue[*cMsg] // Intra-process queue for the messages to signal to the consumers.
-	csl   *Sublist        // Consumer subscription list.
+	cList []*consumer                    // Consumer list.
+	sch   chan struct{}                  // Channel to signal consumers.
+	sigq  *ipQueue[*cMsg]                // Intra-process queue for the messages to signal to the consumers.
+	csl   *gsl.GenericSublist[*consumer] // Consumer subscription list.
 
 	// Leader will store seq/msgTrace in clustering mode. Used in applyStreamEntries
 	// to know if trace event should be sent after processing.
@@ -2211,7 +2211,7 @@ func (mset *stream) purge(preq *JSApiStreamPurgeRequest) (purged uint64, err err
 	mset.mu.RUnlock()
 
 	if preq != nil {
-		purged, err = mset.store.PurgeEx(preq.Subject, preq.Sequence, preq.Keep, preq.NoMarkers)
+		purged, err = mset.store.PurgeEx(preq.Subject, preq.Sequence, preq.Keep, false /*preq.NoMarkers*/)
 	} else {
 		purged, err = mset.store.Purge()
 	}
@@ -2737,12 +2737,13 @@ func (mset *stream) setupMirrorConsumer() error {
 	} else {
 		mset.cancelSourceInfo(mset.mirror)
 		mset.mirror.sseq = mset.lseq
-
-		// If we are no longer the leader stop trying.
-		if !mset.isLeader() {
-			return nil
-		}
 	}
+
+	// If we are no longer the leader stop trying.
+	if !mset.isLeader() {
+		return nil
+	}
+
 	mirror := mset.mirror
 
 	// We want to throttle here in terms of how fast we request new consumers,
@@ -4118,9 +4119,14 @@ func (mset *stream) storeUpdates(md, bd int64, seq uint64, subj string) {
 	if md == -1 && seq > 0 && subj != _EMPTY_ {
 		// We use our consumer list mutex here instead of the main stream lock since it may be held already.
 		mset.clsMu.RLock()
-		// TODO(dlc) - Do sublist like signaling so we do not have to match?
-		for _, o := range mset.cList {
-			o.decStreamPending(seq, subj)
+		if mset.csl != nil {
+			mset.csl.Match(subj, func(o *consumer) {
+				o.decStreamPending(seq, subj)
+			})
+		} else {
+			for _, o := range mset.cList {
+				o.decStreamPending(seq, subj)
+			}
 		}
 		mset.clsMu.RUnlock()
 	} else if md < 0 {
@@ -5320,24 +5326,14 @@ func (mset *stream) signalConsumersLoop() {
 // This will update and signal all consumers that match.
 func (mset *stream) signalConsumers(subj string, seq uint64) {
 	mset.clsMu.RLock()
-	if mset.csl == nil {
-		mset.clsMu.RUnlock()
+	defer mset.clsMu.RUnlock()
+	csl := mset.csl
+	if csl == nil {
 		return
 	}
-	r := mset.csl.Match(subj)
-	mset.clsMu.RUnlock()
-
-	if len(r.psubs) == 0 {
-		return
-	}
-	// Encode the sequence here.
-	var eseq [8]byte
-	var le = binary.LittleEndian
-	le.PutUint64(eseq[:], seq)
-	msg := eseq[:]
-	for _, sub := range r.psubs {
-		sub.icb(sub, nil, nil, subj, _EMPTY_, msg)
-	}
+	csl.Match(subj, func(o *consumer) {
+		o.processStreamSignal(seq)
+	})
 }
 
 // Internal message for use by jetstream subsystem.
@@ -5608,9 +5604,7 @@ func (mset *stream) resetAndWaitOnConsumers() {
 
 	for _, o := range consumers {
 		if node := o.raftNode(); node != nil {
-			if o.IsLeader() {
-				node.StepDown()
-			}
+			node.StepDown()
 			node.Delete()
 		}
 		if o.isMonitorRunning() {
@@ -5892,10 +5886,10 @@ func (mset *stream) setConsumer(o *consumer) {
 	mset.clsMu.Lock()
 	mset.cList = append(mset.cList, o)
 	if mset.csl == nil {
-		mset.csl = NewSublistWithCache()
+		mset.csl = gsl.NewSublist[*consumer]()
 	}
 	for _, sub := range o.signalSubs() {
-		mset.csl.Insert(sub)
+		mset.csl.Insert(sub, o)
 	}
 	mset.clsMu.Unlock()
 }
@@ -5921,7 +5915,7 @@ func (mset *stream) removeConsumer(o *consumer) {
 		// Always remove from the leader sublist.
 		if mset.csl != nil {
 			for _, sub := range o.signalSubs() {
-				mset.csl.Remove(sub)
+				mset.csl.Remove(sub, o)
 			}
 		}
 		mset.clsMu.Unlock()
@@ -5943,7 +5937,7 @@ func (mset *stream) swapSigSubs(o *consumer, newFilters []string) {
 	if o.sigSubs != nil {
 		if mset.csl != nil {
 			for _, sub := range o.sigSubs {
-				mset.csl.Remove(sub)
+				mset.csl.Remove(sub, o)
 			}
 		}
 		o.sigSubs = nil
@@ -5951,19 +5945,17 @@ func (mset *stream) swapSigSubs(o *consumer, newFilters []string) {
 
 	if o.isLeader() {
 		if mset.csl == nil {
-			mset.csl = NewSublistWithCache()
+			mset.csl = gsl.NewSublist[*consumer]()
 		}
 		// If no filters are preset, add fwcs to sublist for that consumer.
 		if newFilters == nil {
-			sub := &subscription{subject: []byte(fwcs), icb: o.processStreamSignal}
-			mset.csl.Insert(sub)
-			o.sigSubs = append(o.sigSubs, sub)
+			mset.csl.Insert(fwcs, o)
+			o.sigSubs = append(o.sigSubs, fwcs)
 			// If there are filters, add their subjects to sublist.
 		} else {
 			for _, filter := range newFilters {
-				sub := &subscription{subject: []byte(filter), icb: o.processStreamSignal}
-				mset.csl.Insert(sub)
-				o.sigSubs = append(o.sigSubs, sub)
+				mset.csl.Insert(filter, o)
+				o.sigSubs = append(o.sigSubs, filter)
 			}
 		}
 	}

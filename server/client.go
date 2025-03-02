@@ -113,8 +113,9 @@ const (
 	maxNoRTTPingBeforeFirstPong = 2 * time.Second
 
 	// For stalling fast producers
-	stallClientMinDuration = 100 * time.Millisecond
-	stallClientMaxDuration = time.Second
+	stallClientMinDuration = 2 * time.Millisecond
+	stallClientMaxDuration = 5 * time.Millisecond
+	stallTotalAllowed      = 10 * time.Millisecond
 )
 
 var readLoopReportThreshold = readLoopReport
@@ -464,6 +465,9 @@ type readCache struct {
 
 	// Capture the time we started processing our readLoop.
 	start time.Time
+
+	// Total time stalled so far for readLoop processing.
+	tst time.Duration
 }
 
 // set the flag (would be equivalent to set the boolean to true)
@@ -1416,6 +1420,11 @@ func (c *client) readLoop(pre []byte) {
 				}
 				return
 			}
+			// Clear total stalled time here.
+			if c.in.tst >= stallClientMaxDuration {
+				c.rateLimitFormatWarnf("Producer was stalled for a total of %v", c.in.tst.Round(time.Millisecond))
+			}
+			c.in.tst = 0
 		}
 
 		// If we are a ROUTER/LEAF and have processed an INFO, it is possible that
@@ -1734,7 +1743,7 @@ func (c *client) flushOutbound() bool {
 
 	// Check if we have a stalled gate and if so and we are recovering release
 	// any stalled producers. Only kind==CLIENT will stall.
-	if c.out.stc != nil && (n == attempted || c.out.pb < c.out.mp/2) {
+	if c.out.stc != nil && (n == attempted || c.out.pb < c.out.mp/4*3) {
 		close(c.out.stc)
 		c.out.stc = nil
 	}
@@ -2327,7 +2336,8 @@ func (c *client) queueOutbound(data []byte) {
 	// Check here if we should create a stall channel if we are falling behind.
 	// We do this here since if we wait for consumer's writeLoop it could be
 	// too late with large number of fan in producers.
-	if c.out.pb > c.out.mp/2 && c.out.stc == nil {
+	// If the outbound connection is > 75% of maximum pending allowed, create a stall gate.
+	if c.out.pb > c.out.mp/4*3 && c.out.stc == nil {
 		c.out.stc = make(chan struct{})
 	}
 }
@@ -3382,31 +3392,37 @@ func (c *client) msgHeader(subj, reply []byte, sub *subscription) []byte {
 }
 
 func (c *client) stalledWait(producer *client) {
+	// Check to see if we have exceeded our total wait time per readLoop invocation.
+	if producer.in.tst > stallTotalAllowed {
+		return
+	}
+
+	// Grab stall channel which the slow consumer will close when caught up.
 	stall := c.out.stc
-	ttl := stallDuration(c.out.pb, c.out.mp)
+
+	// Calculate stall time.
+	ttl := stallClientMinDuration
+	if c.out.pb >= c.out.mp {
+		ttl = stallClientMaxDuration
+	}
+
 	c.mu.Unlock()
 	defer c.mu.Lock()
 
+	// Now check if we are close to total allowed.
+	if producer.in.tst+ttl > stallTotalAllowed {
+		ttl = stallTotalAllowed - producer.in.tst
+	}
 	delay := time.NewTimer(ttl)
 	defer delay.Stop()
 
+	start := time.Now()
 	select {
 	case <-stall:
 	case <-delay.C:
 		producer.Debugf("Timed out of fast producer stall (%v)", ttl)
 	}
-}
-
-func stallDuration(pb, mp int64) time.Duration {
-	ttl := stallClientMinDuration
-	if pb >= mp {
-		ttl = stallClientMaxDuration
-	} else if hmp := mp / 2; pb > hmp {
-		bsz := hmp / 10
-		additional := int64(ttl) * ((pb - hmp) / bsz)
-		ttl += time.Duration(additional)
-	}
-	return ttl
+	producer.in.tst += time.Since(start)
 }
 
 // Used to treat maps as efficient set
@@ -3569,23 +3585,36 @@ func (c *client) deliverMsg(prodIsMQTT bool, sub *subscription, acc *Account, su
 		}
 		client.mu.Unlock()
 
+		// For service imports, track if we delivered.
+		didDeliver := true
+
 		// Internal account clients are for service imports and need the '\r\n'.
 		start := time.Now()
 		if client.kind == ACCOUNT {
 			sub.icb(sub, c, acc, string(subject), string(reply), msg)
+			// If we are a service import check to make sure we delivered the message somewhere.
+			if sub.si {
+				didDeliver = c.pa.delivered
+			}
 		} else {
 			sub.icb(sub, c, acc, string(subject), string(reply), msg[:msgSize])
 		}
 		if dur := time.Since(start); dur >= readLoopReportThreshold {
 			srv.Warnf("Internal subscription on %q took too long: %v", subject, dur)
 		}
-		return true
+
+		return didDeliver
 	}
 
 	// If we are a client and we detect that the consumer we are
 	// sending to is in a stalled state, go ahead and wait here
 	// with a limit.
 	if c.kind == CLIENT && client.out.stc != nil {
+		if srv.getOpts().NoFastProducerStall {
+			mt.addEgressEvent(client, sub, errMsgTraceFastProdNoStall)
+			client.mu.Unlock()
+			return false
+		}
 		client.stalledWait(c)
 	}
 
@@ -4081,7 +4110,7 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 			reply = append(reply, '@')
 			reply = append(reply, c.pa.deliver...)
 		}
-		didDeliver = c.sendMsgToGateways(acc, msg, c.pa.subject, reply, qnames) || didDeliver
+		didDeliver = c.sendMsgToGateways(acc, msg, c.pa.subject, reply, qnames, false) || didDeliver
 	}
 
 	// Check to see if we did not deliver to anyone and the client has a reply subject set
@@ -4128,7 +4157,7 @@ func (c *client) handleGWReplyMap(msg []byte) bool {
 			reply = append(reply, '@')
 			reply = append(reply, c.pa.deliver...)
 		}
-		c.sendMsgToGateways(c.acc, msg, c.pa.subject, reply, nil)
+		c.sendMsgToGateways(c.acc, msg, c.pa.subject, reply, nil, false)
 	}
 	return true
 }
@@ -4307,17 +4336,17 @@ var (
 
 // processServiceImport is an internal callback when a subscription matches an imported service
 // from another account. This includes response mappings as well.
-func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byte) {
+func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byte) bool {
 	// If we are a GW and this is not a direct serviceImport ignore.
 	isResponse := si.isRespServiceImport()
 	if (c.kind == GATEWAY || c.kind == ROUTER) && !isResponse {
-		return
+		return false
 	}
 	// Detect cycles and ignore (return) when we detect one.
 	if len(c.pa.psi) > 0 {
 		for i := len(c.pa.psi) - 1; i >= 0; i-- {
 			if psi := c.pa.psi[i]; psi.se == si.se {
-				return
+				return false
 			}
 		}
 	}
@@ -4339,7 +4368,7 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	// response service imports and rrMap entries which all will need to simply expire.
 	// TODO(dlc) - Come up with something better.
 	if shouldReturn || (checkJS && si.se != nil && si.se.acc == c.srv.SystemAccount()) {
-		return
+		return false
 	}
 
 	mt, traceOnly := c.isMsgTraceEnabled()
@@ -4504,7 +4533,7 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 			flags |= pmrCollectQueueNames
 			var queues [][]byte
 			didDeliver, queues = c.processMsgResults(siAcc, rr, msg, c.pa.deliver, []byte(to), nrr, flags)
-			didDeliver = c.sendMsgToGateways(siAcc, msg, []byte(to), nrr, queues) || didDeliver
+			didDeliver = c.sendMsgToGateways(siAcc, msg, []byte(to), nrr, queues, false) || didDeliver
 		} else {
 			didDeliver, _ = c.processMsgResults(siAcc, rr, msg, c.pa.deliver, []byte(to), nrr, flags)
 		}
@@ -4513,6 +4542,10 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	// Restore to original values.
 	c.in.rts = orts
 	c.pa = pacopy
+
+	// Before we undo didDeliver based on tracing and last mile, mark in the c.pa which informs us of no responders status.
+	// If we override due to tracing and traceOnly we do not want to send back a no responders.
+	c.pa.delivered = didDeliver
 
 	// If this was a message trace but we skip last-mile delivery, we need to
 	// do the remove, so:
@@ -4549,6 +4582,8 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 			siAcc.removeRespServiceImport(rsi, reason)
 		}
 	}
+
+	return didDeliver
 }
 
 func (c *client) addSubToRouteTargets(sub *subscription) {

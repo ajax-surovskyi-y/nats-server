@@ -14,6 +14,8 @@
 // Do not exlude this file with the !skip_js_tests since those helpers
 // are also used by MQTT.
 
+//lint:file-ignore U1000 Avoid detecting as unused code
+
 package server
 
 import (
@@ -2107,6 +2109,10 @@ func checkState(t *testing.T, c *cluster, accountName, streamName string) error 
 	for _, srv := range c.servers {
 		if srv == leaderSrv {
 			// Skip self
+			continue
+		}
+		if srv.isShuttingDown() {
+			// Skip if shutdown.
 			continue
 		}
 		acc, err := srv.LookupAccount(accountName)

@@ -216,16 +216,16 @@ func (a *stateAdder) waitGroup() *sync.WaitGroup {
 }
 
 func (a *stateAdder) propose(data []byte) {
-	a.Lock()
-	defer a.Unlock()
-	a.n.ForwardProposal(data)
+	// Don't hold state machine lock as we could deadlock if the node was locked as part of the test.
+	n := a.node()
+	n.ForwardProposal(data)
 }
 
 func (a *stateAdder) applyEntry(ce *CommittedEntry) {
 	a.Lock()
-	defer a.Unlock()
 	if ce == nil {
 		// This means initial state is done/replayed.
+		a.Unlock()
 		return
 	}
 	for _, e := range ce.Entries {
@@ -237,7 +237,10 @@ func (a *stateAdder) applyEntry(ce *CommittedEntry) {
 		}
 	}
 	// Update applied.
-	a.n.Applied(ce.Index)
+	// But don't hold state machine lock as we could deadlock if the node was locked as part of the test.
+	n := a.n
+	a.Unlock()
+	n.Applied(ce.Index)
 }
 
 func (a *stateAdder) leaderChange(isLeader bool) {
@@ -309,18 +312,22 @@ func (a *stateAdder) total() int64 {
 
 // Install a snapshot.
 func (a *stateAdder) snapshot(t *testing.T) {
+	// Don't hold state machine lock as we could deadlock if the node was locked as part of the test.
 	a.Lock()
-	defer a.Unlock()
+	sum := a.sum
+	rn := a.n
+	a.Unlock()
+
 	data := make([]byte, binary.MaxVarintLen64)
-	n := binary.PutVarint(data, a.sum)
+	n := binary.PutVarint(data, sum)
 	snap := data[:n]
-	require_NoError(t, a.n.InstallSnapshot(snap))
+	require_NoError(t, rn.InstallSnapshot(snap))
 }
 
 // Helper to wait for a certain state.
 func (rg smGroup) waitOnTotal(t *testing.T, expected int64) {
 	t.Helper()
-	checkFor(t, 20*time.Second, 200*time.Millisecond, func() error {
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
 		for _, sm := range rg {
 			asm := sm.(*stateAdder)
 			if total := asm.total(); total != expected {

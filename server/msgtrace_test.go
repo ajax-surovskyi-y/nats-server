@@ -1,4 +1,4 @@
-// Copyright 2024 The NATS Authors
+// Copyright 2024-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -564,10 +564,8 @@ func TestMsgTraceEgressErrors(t *testing.T) {
 				}
 				msg.Data = []byte("hello")
 				nc2.PublishMsg(msg)
-				time.Sleep(10 * time.Millisecond)
-				cid, err = nc2.GetClientID()
-				require_NoError(t, err)
-				c = s.GetClient(cid)
+				// This needs to be less than default stall time, which now is 2ms.
+				time.Sleep(1 * time.Millisecond)
 				c.mu.Lock()
 				c.flags.set(closeConnection)
 				c.mu.Unlock()
@@ -1799,7 +1797,7 @@ func TestMsgTraceServiceImport(t *testing.T) {
 						}
 					}
 					// Check that no (more) messages are received.
-					if msg, err := sub.NextMsg(100 * time.Millisecond); msg != nil || err != nats.ErrTimeout {
+					if msg, err := sub.NextMsg(100 * time.Millisecond); msg != nil || (err != nats.ErrTimeout && err != nats.ErrNoResponders) {
 						t.Fatalf("Did not expect application message, got msg=%v err=%v", msg, err)
 					}
 					if !test.deliverMsg {
@@ -2072,7 +2070,7 @@ func TestMsgTraceServiceImportWithSuperCluster(t *testing.T) {
 						}
 					}
 					// Check that no (more) messages are received.
-					if msg, err := sub.NextMsg(100 * time.Millisecond); msg != nil || err != nats.ErrTimeout {
+					if msg, err := sub.NextMsg(100 * time.Millisecond); msg != nil || (err != nats.ErrTimeout && err != nats.ErrNoResponders) {
 						t.Fatalf("Did not expect application message, got msg=%v err=%v", msg, err)
 					}
 					if !test.deliverMsg {
@@ -2523,7 +2521,7 @@ func TestMsgTraceServiceImportWithLeafNodeLeaf(t *testing.T) {
 				require_Equal[string](t, string(appMsg.Data), "request2")
 			}
 			// Check that no (more) messages are received.
-			if msg, err := sub.NextMsg(100 * time.Millisecond); msg != nil || err != nats.ErrTimeout {
+			if msg, err := sub.NextMsg(100 * time.Millisecond); msg != nil || (err != nats.ErrTimeout && err != nats.ErrNoResponders) {
 				t.Fatalf("Did not expect application message, got msg=%v err=%v", msg, err)
 			}
 			if !test.deliverMsg {

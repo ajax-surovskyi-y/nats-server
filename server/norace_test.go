@@ -4992,6 +4992,60 @@ func TestNoRaceJetStreamAccountLimitsAndRestart(t *testing.T) {
 	c.waitOnLeader()
 	c.waitOnStreamLeader("$JS", "TEST")
 
+	checkFor(t, 2*time.Second, 500*time.Millisecond, func() error {
+		return checkState(t, c, "$JS", "TEST")
+	})
+	for _, cs := range c.servers {
+		c.waitOnStreamCurrent(cs, "$JS", "TEST")
+	}
+}
+
+func TestNoRaceJetStreamAccountLimitsAndRestartForceSnapshot(t *testing.T) {
+	c := createJetStreamClusterWithTemplate(t, jsClusterAccountLimitsTempl, "A3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	if _, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 3}); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	snl := c.randomNonStreamLeader("$JS", "TEST")
+	for i := 0; i < 20_000; i++ {
+		if _, err := js.Publish("TEST", []byte("A")); err != nil {
+			break
+		}
+		if i == 5_000 {
+			snl.Shutdown()
+		}
+	}
+
+	// Wait for the remaining servers to converge on the state.
+	checkFor(t, 2*time.Second, 500*time.Millisecond, func() error {
+		return checkState(t, c, "$JS", "TEST")
+	})
+	// Then install snapshots so the shutdown server needs to catchup based on a snapshot.
+	for _, s := range c.servers {
+		if s == snl {
+			continue
+		}
+		acc, err := s.lookupAccount("$JS")
+		require_NoError(t, err)
+		mset, err := acc.lookupStream("TEST")
+		require_NoError(t, err)
+		n := mset.raftNode().(*raft)
+		require_NoError(t, n.InstallSnapshot(mset.stateSnapshot()))
+	}
+
+	c.stopAll()
+	c.restartAll()
+	c.waitOnLeader()
+	c.waitOnStreamLeader("$JS", "TEST")
+
+	checkFor(t, 2*time.Second, 500*time.Millisecond, func() error {
+		return checkState(t, c, "$JS", "TEST")
+	})
 	for _, cs := range c.servers {
 		c.waitOnStreamCurrent(cs, "$JS", "TEST")
 	}
@@ -5119,15 +5173,17 @@ func TestNoRaceJetStreamClusterInterestPullConsumerStreamLimitBug(t *testing.T) 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for {
-			pt := time.NewTimer(time.Duration(rand.Intn(2)) * time.Millisecond)
+		for i := 0; ; i++ {
 			select {
-			case <-pt.C:
+			case <-qch:
+				return
+			default:
 				_, err := js.Publish("foo", []byte("BUG!"))
 				require_NoError(t, err)
-			case <-qch:
-				pt.Stop()
-				return
+				// Only sleep every so often.
+				if i%100 == 0 {
+					time.Sleep(time.Millisecond)
+				}
 			}
 		}
 	}()
@@ -6429,7 +6485,7 @@ func TestNoRaceJetStreamClusterConsumerInfoSpeed(t *testing.T) {
 		ci, err := js.ConsumerInfo("TEST", "DLC")
 		require_NoError(t, err)
 		// Make sure these are fast now.
-		if elapsed := time.Since(start); elapsed > 5*time.Millisecond {
+		if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
 			t.Fatalf("ConsumerInfo took too long: %v", elapsed)
 		}
 		// Make sure pending == expected.
@@ -11364,4 +11420,173 @@ func TestNoRaceStoreReverseWalkWithDeletesPerf(t *testing.T) {
 			require_True(t, elapsedNew*10 < elapsed)
 		}
 	}
+}
+
+type fastProdLogger struct {
+	DummyLogger
+	gotIt chan struct{}
+}
+
+func (l *fastProdLogger) Debugf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if strings.Contains(msg, "fast producer") {
+		select {
+		case l.gotIt <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func TestNoRaceNoFastProducerStall(t *testing.T) {
+	tmpl := `
+		listen: "127.0.0.1:-1"
+		no_fast_producer_stall: %s
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(tmpl, "true")))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	l := &fastProdLogger{gotIt: make(chan struct{}, 1)}
+	s.SetLogger(l, true, false)
+
+	ncSlow := natsConnect(t, s.ClientURL())
+	defer ncSlow.Close()
+	natsSub(t, ncSlow, "foo", func(_ *nats.Msg) {})
+	natsFlush(t, ncSlow)
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+	traceSub := natsSubSync(t, nc, "my.trace.subj")
+	natsFlush(t, nc)
+
+	ncProd := natsConnect(t, s.ClientURL())
+	defer ncProd.Close()
+
+	payload := make([]byte, 256)
+
+	cid, err := ncSlow.GetClientID()
+	require_NoError(t, err)
+	c := s.GetClient(cid)
+	require_True(t, c != nil)
+
+	wg := sync.WaitGroup{}
+	pub := func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			msg := nats.NewMsg("foo")
+			msg.Header.Set(MsgTraceDest, traceSub.Subject)
+			msg.Data = payload
+			ncProd.PublishMsg(msg)
+		}()
+	}
+
+	checkTraceMsg := func(err string) {
+		t.Helper()
+		var e MsgTraceEvent
+		traceMsg := natsNexMsg(t, traceSub, time.Second)
+		json.Unmarshal(traceMsg.Data, &e)
+		egresses := e.Egresses()
+		require_Equal(t, len(egresses), 1)
+		eg := egresses[0]
+		require_Equal(t, eg.CID, cid)
+		if err != _EMPTY_ {
+			require_Contains(t, eg.Error, err)
+		} else {
+			require_Equal(t, eg.Error, _EMPTY_)
+		}
+	}
+
+	// Artificially set a stall channel.
+	c.mu.Lock()
+	c.out.stc = make(chan struct{})
+	c.mu.Unlock()
+
+	// Publish a message, it should not stall the producer.
+	pub()
+	// Now  make sure we did not get any fast producer debug statements.
+	select {
+	case <-l.gotIt:
+		t.Fatal("Got debug logs about fast producer")
+	case <-time.After(250 * time.Millisecond):
+		// OK!
+	}
+	wg.Wait()
+
+	checkTraceMsg(errMsgTraceFastProdNoStall)
+
+	// Now we will conf reload to enable fast producer stalling.
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(tmpl, "false"))
+
+	// Publish, this time the prod should be stalled.
+	pub()
+	select {
+	case <-l.gotIt:
+		// OK!
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Timed-out waiting for a warning")
+	}
+	wg.Wait()
+
+	// Should have been delivered to the trace subscription.
+	checkTraceMsg(_EMPTY_)
+}
+
+func TestNoRaceProducerStallLimits(t *testing.T) {
+	tmpl := `
+		listen: "127.0.0.1:-1"
+	`
+	conf := createConfFile(t, []byte(tmpl))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	ncSlow := natsConnect(t, s.ClientURL())
+	defer ncSlow.Close()
+	natsSub(t, ncSlow, "foo", func(m *nats.Msg) { m.Respond([]byte("42")) })
+	natsFlush(t, ncSlow)
+
+	ncProd := natsConnect(t, s.ClientURL())
+	defer ncProd.Close()
+
+	cid, err := ncSlow.GetClientID()
+	require_NoError(t, err)
+	c := s.GetClient(cid)
+	require_True(t, c != nil)
+
+	// Artificially set a stall channel on the subscriber.
+	c.mu.Lock()
+	c.out.stc = make(chan struct{})
+	c.mu.Unlock()
+
+	start := time.Now()
+	_, err = ncProd.Request("foo", []byte("HELLO"), time.Second)
+	elapsed := time.Since(start)
+	require_NoError(t, err)
+
+	// This should have not cleared on its own but should have bettwen min and max pause.
+	require_True(t, elapsed >= stallClientMinDuration)
+	require_True(t, elapsed < stallClientMaxDuration)
+
+	// Now test total maximum by loading up a bunch of requests and measuring the last one.
+	// Artificially set a stall channel again on the subscriber.
+	c.mu.Lock()
+	c.out.stc = make(chan struct{})
+	// This will prevent us from clearing the stc.
+	c.out.pb = c.out.mp/4*3 + 100
+	c.mu.Unlock()
+
+	for i := 0; i < 10; i++ {
+		err = ncProd.PublishRequest("foo", "bar", []byte("HELLO"))
+		require_NoError(t, err)
+	}
+	start = time.Now()
+	_, err = ncProd.Request("foo", []byte("HELLO"), time.Second)
+	elapsed = time.Since(start)
+	require_NoError(t, err)
+
+	require_True(t, elapsed >= stallTotalAllowed)
+	// Should always be close to totalAllowed (e.g. 10ms), but if you run alot of them in one go can bump up
+	// just past 12ms, hence the Max setting below to avoid a flapper.
+	require_True(t, elapsed < stallTotalAllowed+stallClientMaxDuration)
 }

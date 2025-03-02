@@ -296,7 +296,7 @@ func (s *Server) JetStreamStepdownStream(account, stream string) error {
 		return err
 	}
 
-	if node := mset.raftNode(); node != nil && node.Leader() {
+	if node := mset.raftNode(); node != nil {
 		node.StepDown()
 	}
 
@@ -327,7 +327,7 @@ func (s *Server) JetStreamStepdownConsumer(account, stream, consumer string) err
 		return NewJSConsumerNotFoundError()
 	}
 
-	if node := o.raftNode(); node != nil && node.Leader() {
+	if node := o.raftNode(); node != nil {
 		node.StepDown()
 	}
 
@@ -1138,65 +1138,6 @@ func (js *jetStream) checkForOrphans() {
 	}
 }
 
-// Check and delete any orphans we may come across.
-func (s *Server) checkForNRGOrphans() {
-	js, cc := s.getJetStreamCluster()
-	if js == nil || cc == nil || js.isMetaRecovering() {
-		// No cluster means no NRGs. Also return if still recovering.
-		return
-	}
-
-	// Track which assets R>1 should be on this server.
-	nrgMap := make(map[string]struct{})
-	trackGroup := func(rg *raftGroup) {
-		// If R>1 track this as a legit NRG.
-		if rg.node != nil {
-			nrgMap[rg.Name] = struct{}{}
-		}
-	}
-	// Register our meta.
-	js.mu.RLock()
-	meta := cc.meta
-	if meta == nil {
-		js.mu.RUnlock()
-		// Bail with no meta node.
-		return
-	}
-
-	ourID := meta.ID()
-	nrgMap[meta.Group()] = struct{}{}
-
-	// Collect all valid groups from our assignments.
-	for _, asa := range cc.streams {
-		for _, sa := range asa {
-			if sa.Group.isMember(ourID) && sa.Restore == nil {
-				trackGroup(sa.Group)
-				for _, ca := range sa.consumers {
-					if ca.Group.isMember(ourID) {
-						trackGroup(ca.Group)
-					}
-				}
-			}
-		}
-	}
-	js.mu.RUnlock()
-
-	// Check NRGs that are running.
-	var needDelete []RaftNode
-	s.rnMu.RLock()
-	for name, n := range s.raftNodes {
-		if _, ok := nrgMap[name]; !ok {
-			needDelete = append(needDelete, n)
-		}
-	}
-	s.rnMu.RUnlock()
-
-	for _, n := range needDelete {
-		s.Warnf("Detected orphaned NRG %q, will cleanup", n.Group())
-		n.Delete()
-	}
-}
-
 func (js *jetStream) monitorCluster() {
 	s, n := js.server(), js.getMetaGroup()
 	qch, rqch, lch, aq := js.clusterQuitC(), n.QuitC(), n.LeadChangeC(), n.ApplyQ()
@@ -1229,8 +1170,6 @@ func (js *jetStream) monitorCluster() {
 		if hs := s.healthz(nil); hs.Error != _EMPTY_ {
 			s.Warnf("%v", hs.Error)
 		}
-		// Also check for orphaned NRGs.
-		s.checkForNRGOrphans()
 	}
 
 	var (
@@ -1588,10 +1527,11 @@ func (js *jetStream) applyMetaSnapshot(buf []byte, ru *recoveryUpdates, isRecove
 		}
 		if osa := js.streamAssignment(sa.Client.serviceAccount(), sa.Config.Name); osa != nil {
 			for _, ca := range osa.consumers {
-				if sa.consumers[ca.Name] == nil {
+				// Consumer was either removed, or recreated with a different raft group.
+				if nca := sa.consumers[ca.Name]; nca == nil {
 					caDel = append(caDel, ca)
-				} else {
-					caAdd = append(caAdd, ca)
+				} else if nca.Group != nil && ca.Group != nil && nca.Group.Name != ca.Group.Name {
+					caDel = append(caDel, ca)
 				}
 			}
 		}
@@ -2204,15 +2144,6 @@ func (mset *stream) removeNode() {
 	}
 }
 
-func (mset *stream) clearRaftNode() {
-	if mset == nil {
-		return
-	}
-	mset.mu.Lock()
-	defer mset.mu.Unlock()
-	mset.node = nil
-}
-
 // Helper function to generate peer info.
 // lists and sets for old and new.
 func genPeerInfo(peers []string, split int) (newPeers, oldPeers []string, newPeerSet, oldPeerSet map[string]bool) {
@@ -2330,9 +2261,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 		if n.State() == Closed {
 			return
 		}
-		if n.Leader() {
-			n.StepDown()
-		}
+		n.StepDown()
 		// Drain the commit queue...
 		aq.drain()
 	}()
@@ -2866,11 +2795,11 @@ func (mset *stream) isMigrating() bool {
 func (mset *stream) resetClusteredState(err error) bool {
 	mset.mu.RLock()
 	s, js, jsa, sa, acc, node := mset.srv, mset.js, mset.jsa, mset.sa, mset.acc, mset.node
-	stype, isLeader, tierName, replicas := mset.cfg.Storage, mset.isLeader(), mset.tier, mset.cfg.Replicas
+	stype, tierName, replicas := mset.cfg.Storage, mset.tier, mset.cfg.Replicas
 	mset.mu.RUnlock()
 
 	// Stepdown regardless if we are the leader here.
-	if isLeader && node != nil {
+	if node != nil {
 		node.StepDown()
 	}
 
@@ -3631,9 +3560,7 @@ func (s *Server) removeStream(mset *stream, nsa *streamAssignment) {
 	// Make sure to use the new stream assignment, not our own.
 	s.Debugf("JetStream removing stream '%s > %s' from this server", nsa.Client.serviceAccount(), nsa.Config.Name)
 	if node := mset.raftNode(); node != nil {
-		if node.Leader() {
-			node.StepDown(nsa.Group.Preferred)
-		}
+		node.StepDown(nsa.Group.Preferred)
 		// shutdown monitor by shutting down raft.
 		node.Delete()
 	}
@@ -5129,11 +5056,13 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 				}
 			case updateSkipOp:
 				o.mu.Lock()
-				if !o.isLeader() {
-					var le = binary.LittleEndian
-					if sseq := le.Uint64(buf[1:]); sseq > o.sseq {
-						o.sseq = sseq
-					}
+				var le = binary.LittleEndian
+				sseq := le.Uint64(buf[1:])
+				if !o.isLeader() && sseq > o.sseq {
+					o.sseq = sseq
+				}
+				if o.store != nil {
+					o.store.UpdateStarting(sseq - 1)
 				}
 				o.mu.Unlock()
 			case addPendingRequest:
@@ -5168,6 +5097,16 @@ func (o *consumer) processReplicatedAck(dseq, sseq uint64) error {
 	// Update activity.
 	o.lat = time.Now()
 
+	var sagap uint64
+	if o.cfg.AckPolicy == AckAll {
+		// Always use the store state, as o.asflr is skipped ahead already.
+		// Capture before updating store.
+		state, err := o.store.BorrowState()
+		if err == nil {
+			sagap = sseq - state.AckFloor.Stream
+		}
+	}
+
 	// Do actual ack update to store.
 	// Always do this to have it recorded.
 	o.store.UpdateAcks(dseq, sseq)
@@ -5191,21 +5130,6 @@ func (o *consumer) processReplicatedAck(dseq, sseq uint64) error {
 	if o.retention == LimitsPolicy {
 		o.mu.Unlock()
 		return nil
-	}
-
-	var sagap uint64
-	if o.cfg.AckPolicy == AckAll {
-		if o.isLeader() {
-			sagap = sseq - o.asflr
-		} else {
-			// We are a follower so only have the store state, so read that in.
-			state, err := o.store.State()
-			if err != nil {
-				o.mu.Unlock()
-				return err
-			}
-			sagap = sseq - state.AckFloor.Stream
-		}
 	}
 	o.mu.Unlock()
 
@@ -6148,7 +6072,14 @@ func (js *jetStream) jsClusteredStreamLimitsCheck(acc *Account, cfg *StreamConfi
 	numStreams, reservations := tieredStreamAndReservationCount(asa, tier, cfg)
 	// Check for inflight proposals...
 	if cc := js.cluster; cc != nil && cc.inflight != nil {
-		numStreams += len(cc.inflight[acc.Name])
+		streams := cc.inflight[acc.Name]
+		numStreams += len(streams)
+		// If inflight contains the same stream, don't count toward exceeding maximum.
+		if cfg != nil {
+			if _, ok := streams[cfg.Name]; ok {
+				numStreams--
+			}
+		}
 	}
 	if selectedLimits.MaxStreams > 0 && numStreams >= selectedLimits.MaxStreams {
 		return NewJSMaximumStreamsLimitError()
@@ -6186,6 +6117,7 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, acc *Account, subject,
 
 	// Capture if we have existing assignment first.
 	if osa := js.streamAssignment(acc.Name, cfg.Name); osa != nil {
+		copyStreamMetadata(cfg, osa.Config)
 		if !reflect.DeepEqual(osa.Config, cfg) {
 			resp.Error = NewJSStreamNameExistError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
@@ -6256,7 +6188,7 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, acc *Account, subject,
 		// On success, add this as an inflight proposal so we can apply limits
 		// on concurrent create requests while this stream assignment has
 		// possibly not been processed yet.
-		if streams, ok := cc.inflight[acc.Name]; ok {
+		if streams, ok := cc.inflight[acc.Name]; ok && self == nil {
 			streams[cfg.Name] = &inflightInfo{rg, syncSubject}
 		}
 	}
@@ -6333,7 +6265,6 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	var resp = JSApiStreamUpdateResponse{ApiResponse: ApiResponse{Type: JSApiStreamUpdateResponseType}}
 
 	osa := js.streamAssignment(acc.Name, cfg.Name)
-
 	if osa == nil {
 		resp.Error = NewJSStreamNotFoundError()
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
@@ -6341,7 +6272,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	}
 
 	// Update asset version metadata.
-	setStaticStreamMetadata(cfg, osa.Config)
+	setStaticStreamMetadata(cfg)
 
 	var newCfg *StreamConfig
 	if jsa := js.accounts[acc.Name]; jsa != nil {
@@ -7464,15 +7395,19 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 				s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
 				return
 			}
+		} else {
+			// Initialize/update asset version metadata.
+			// First time creating this consumer, or updating.
+			setStaticConsumerMetadata(cfg)
 		}
 	}
 
 	// Initialize/update asset version metadata.
-	var oldCfg *ConsumerConfig
-	if ca != nil {
-		oldCfg = ca.Config
+	// But only if we're not creating, should only update it the first time
+	// to be idempotent with versions where there's no versioning metadata.
+	if action != ActionCreate {
+		setStaticConsumerMetadata(cfg)
 	}
-	setStaticConsumerMetadata(cfg, oldCfg)
 
 	// If this is new consumer.
 	if ca == nil {
@@ -8712,9 +8647,6 @@ func (mset *stream) processCatchupMsg(msg []byte) (uint64, error) {
 	mset.mu.Lock()
 	st := mset.cfg.Storage
 	ddloaded := mset.ddloaded
-	tierName := mset.tier
-	replicas := mset.cfg.Replicas
-
 	if mset.hasAllPreAcks(seq, subj) {
 		mset.clearAllPreAcks(seq)
 		// Mark this to be skipped
@@ -8722,11 +8654,8 @@ func (mset *stream) processCatchupMsg(msg []byte) (uint64, error) {
 	}
 	mset.mu.Unlock()
 
+	// Since we're clustered we do not want to check limits based on tier here and possibly introduce skew.
 	if mset.js.limitsExceeded(st) {
-		return 0, NewJSInsufficientResourcesError()
-	} else if exceeded, apiErr := mset.jsa.limitsExceeded(st, tierName, replicas); apiErr != nil {
-		return 0, apiErr
-	} else if exceeded {
 		return 0, NewJSInsufficientResourcesError()
 	}
 

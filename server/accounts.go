@@ -466,11 +466,20 @@ func (a *Account) getNameTag() string {
 		return _EMPTY_
 	}
 	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.getNameTagLocked()
+}
+
+// getNameTagLocked will return the name tag or the account name if not set.
+// Lock should be held.
+func (a *Account) getNameTagLocked() string {
+	if a == nil {
+		return _EMPTY_
+	}
 	nameTag := a.nameTag
 	if nameTag == _EMPTY_ {
 		nameTag = a.Name
 	}
-	a.mu.RUnlock()
 	return nameTag
 }
 
@@ -907,9 +916,14 @@ func (a *Account) Interest(subject string) int {
 func (a *Account) addClient(c *client) int {
 	a.mu.Lock()
 	n := len(a.clients)
-	if a.clients != nil {
-		a.clients[c] = struct{}{}
+
+	// Could come here earlier than the account is registered with the server.
+	// Make sure we can still track clients.
+	if a.clients == nil {
+		a.clients = make(map[*client]struct{})
 	}
+	a.clients[c] = struct{}{}
+
 	// If we did not add it, we are done
 	if n == len(a.clients) {
 		a.mu.Unlock()
@@ -2072,7 +2086,7 @@ func (a *Account) addServiceImportSub(si *serviceImport) error {
 	a.mu.Unlock()
 
 	cb := func(sub *subscription, c *client, acc *Account, subject, reply string, msg []byte) {
-		c.processServiceImport(si, acc, msg)
+		c.pa.delivered = c.processServiceImport(si, acc, msg)
 	}
 	sub, err := c.processSubEx([]byte(subject), nil, []byte(sid), cb, true, true, false)
 	if err != nil {
