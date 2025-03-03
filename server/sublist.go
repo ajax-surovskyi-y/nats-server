@@ -736,13 +736,9 @@ func addNodeToResults(n *node, results *SublistResult) {
 			results.qsubs = append(results.qsubs, nqsub)
 		}
 		for sub := range qr {
-			if isRemoteQSub(sub) {
-				ns := atomic.LoadInt32(&sub.qw)
-				// Shadow these subscriptions
-				for n := 0; n < int(ns); n++ {
-					results.qsubs[i] = append(results.qsubs[i], sub)
-				}
-			} else {
+			ns := atomic.LoadInt32(&sub.qw)
+			// Shadow these subscriptions
+			for n := 0; n < int(ns); n++ {
 				results.qsubs[i] = append(results.qsubs[i], sub)
 			}
 		}

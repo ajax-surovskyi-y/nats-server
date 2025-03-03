@@ -2724,22 +2724,30 @@ func (c *client) parseSub(argo []byte, noForward bool) error {
 		subject []byte
 		queue   []byte
 		sid     []byte
+		qw      int32
 	)
 	switch len(args) {
 	case 2:
 		subject = args[0]
 		queue = nil
 		sid = args[1]
+		qw = 1
 	case 3:
 		subject = args[0]
 		queue = args[1]
 		sid = args[2]
+		qw = 1
+	case 4:
+		subject = args[0]
+		queue = args[1]
+		sid = args[2]
+		qw = int32(parseInt64(args[3]))
 	default:
 		return fmt.Errorf("processSub Parse Error: %q", arg)
 	}
 	// If there was an error, it has been sent to the client. We don't return an
 	// error here to not close the connection as a parsing error.
-	c.processSub(subject, queue, sid, nil, noForward)
+	c.processSubExWithWeight(subject, queue, sid, nil, noForward, false, false, qw)
 	return nil
 }
 
@@ -2748,8 +2756,12 @@ func (c *client) processSub(subject, queue, bsid []byte, cb msgHandler, noForwar
 }
 
 func (c *client) processSubEx(subject, queue, bsid []byte, cb msgHandler, noForward, si, rsi bool) (*subscription, error) {
+	return c.processSubExWithWeight(subject, queue, bsid, cb, noForward, si, rsi, 1)
+}
+
+func (c *client) processSubExWithWeight(subject, queue, bsid []byte, cb msgHandler, noForward, si, rsi bool, qw int32) (*subscription, error) {
 	// Create the subscription
-	sub := &subscription{client: c, subject: subject, queue: queue, sid: bsid, icb: cb, si: si, rsi: rsi}
+	sub := &subscription{client: c, subject: subject, queue: queue, sid: bsid, icb: cb, si: si, rsi: rsi, qw: qw}
 
 	c.mu.Lock()
 
