@@ -2746,7 +2746,7 @@ func (c *client) processSub(subject, queue, bsid []byte, cb msgHandler, noForwar
 }
 
 func (c *client) processSubEx(subject, queue, bsid []byte, cb msgHandler, noForward, si, rsi bool) (*subscription, error) {
-	return c.processSubExWithWeight(subject, queue, bsid, cb, noForward, si, rsi, 0)
+	return c.processSubExWithWeight(subject, queue, bsid, cb, noForward, si, rsi, 1)
 }
 
 func (c *client) processSubExWithWeight(subject, queue, bsid []byte, cb msgHandler, noForward, si, rsi bool, qw int32) (*subscription, error) {
